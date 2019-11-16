@@ -1,0 +1,152 @@
+---
+title: "Math 161 Spatial Statistics - Final Project"
+author: "Nate Stringham"
+date: "4/16/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The Goal of this project is to utilize spatial kriging to create heat maps for NBA players.
+
+Research Questions
+- How does a NBA player’s scoring efficiency change with shot location?
+- Can predict where on the court they are most efficient?
+
+We'll need the following packages to aid us in our analysis. 
+  1. tidyverse - access to many important data wrangling, cleaning, and viz tools.
+  2. SpatialBall - This package contains shot data for the 2016-17 NBA season including the location of every shot.
+  3. sp and gstat - Provide methods for implementing spatial kriging.
+  
+```{r}
+# Dependencies
+library(tidyverse)
+library(SpatialBall)
+library(sp)
+library(gstat)
+```
+
+First we need to wrangle our data into a format that makes sense for our analysis. We are interested in analyzing the scoring efficiency of various NBA players which is traditionally done with a half court shot chart. We'll need to filter the data to only include shots from halfcourt (we aren't concerned with shots taken from beyond halfcourt) and also select for our player of interest. We'll also add a new feature, points per shot (PPS), to our data frame in order to analyze scoring efficiency.
+
+```{r}
+# Player of Interest
+player <- "Damian Lillard"
+
+#Filter player's shot data to half court
+PlayerShots <- season2017 %>% 
+  select(PLAYER_NAME,LOC_X, LOC_Y, SHOT_TYPE, SHOT_MADE_FLAG) %>%
+  filter(PLAYER_NAME == player, LOC_Y < 500)
+
+#Add columns to show shot type, 
+# whether it was made/missed, and points per shot
+PlayerShots$TYPE <- ifelse(PlayerShots$SHOT_TYPE == "2PT Field Goal", 2, 3)
+PlayerShots$Made_Miss <- ifelse(PlayerShots$SHOT_MADE_FLAG == 0, 0, 1)
+PlayerShots$PPS <- (PlayerShots$TYPE)*(PlayerShots$Made_Miss)
+
+head(PlayerShots)
+```
+
+Note that some players have taken multiple shots from the same court location, so we need our PPS value to take this into account for these shot locations.
+```{r}
+# Find all of the duplicate shot locations
+nvals <- PlayerShots %>% 
+  group_by(LOC_X, LOC_Y) %>%
+  count()
+
+# Number of shots taken at each location
+head(nvals)
+
+#Join nvals to the original table and create pps avg - thin data set to include only distinct values.
+PlayerShots2 <- PlayerShots %>% 
+  left_join(nvals) %>% 
+  group_by(LOC_X, LOC_Y) %>%
+  mutate(ppsum = sum(PPS), ppsavg = ppsum/n) %>%
+  distinct(LOC_X, LOC_Y, .keep_all = TRUE)
+
+head(PlayerShots2)
+```
+
+Now that we have our feature of interest (PPS) it's time to create some spatial objects so that we can perform the spatial analysis. We'll need the following objects:
+- spatial points dataframe
+- prediction grid
+
+```{r}
+# Create a spatial points dataframe from shot locations
+coordinates(PlayerShots2)<- ~LOC_X + LOC_Y
+class(PlayerShots2)
+
+#Make the spatial grid for predictions
+grid <- expand.grid(x = seq(-255, 255, by = 7.5), y = seq(-75, 400, by= 7.5))
+class(grid)
+plot(grid)
+
+coordinates(grid)<- ~x+y
+class(grid)
+
+courtgrid <- SpatialPixels(grid)
+class(courtgrid)
+
+plot(courtgrid)
+```
+
+
+
+One of the advantages of Spatial Kriging is it takes into account the variation of our feature of interest as a function of distance. Thus, we first need to capture this variation by building a sample variogram (variogram cloud is also helpful to gain understanding about this variation)
+
+```{r}
+# Plot Variogram cloud
+#vargram.cloud <- gstat::variogram(ppsavg~1, data = PlayerShots2, cloud = TRUE)
+#plot(vargram.cloud)
+
+# Plot variogram
+vargram <- gstat::variogram(ppsavg~1, data = PlayerShots2)
+plot(vargram)
+
+# find the best fit for the variogram
+fit <- fit.variogram(vargram, vgm("Sph", "Mat", "Exp"))
+plot(vargram, model = fit)
+
+```
+
+
+Now we are ready to perform the Kriging and visualize the results! 
+
+```{r}
+# Make Kriged predictions
+z.krige <- gstat::krige(ppsavg~1, PlayerShots2, courtgrid, model = fit)
+
+# Visualize
+spplot(z.krige["var1.pred"], at = seq(0,3, by =.25))
+spplot(z.krige["var1.var"], at = seq(0,3, by = .25))
+```
+
+
+
+
+As a final step, we can run a Moran's I test to get a feel for the amount of spatial autocorrelation present.
+
+```{r}
+library(spdep)
+# Run Moran's I
+
+#Create neighbor list (graph-based since working with points)
+grph <- relativeneigh(PlayerShots2)
+neib <- graph2nb(grph)
+neib.listw <- nb2listw(neib, style="B", zero.policy = TRUE)
+
+
+mtest <- moran.test(PlayerShots2@data$ppsavg, listw=neib.listw, alternative="two.sided", zero.policy = TRUE)
+mtest
+
+sim1 <- moran.mc(PlayerShots2@data$ppsavg, listw=neib.listw, nsim=99, zero.policy = TRUE, alternative="less")
+sim1
+```
+
+After running Moran's I we see that the p-value fairly high and the Moran's I statistic very close to zero meaning that there is not strong positive spatial autocorrelation.
+
+
+
+
+
